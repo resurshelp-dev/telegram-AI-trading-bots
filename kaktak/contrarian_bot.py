@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 import warnings
 from dataclasses import dataclass, fields
