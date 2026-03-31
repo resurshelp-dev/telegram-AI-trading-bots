@@ -595,9 +595,6 @@ class BingXTrader:
             return {"code": -1, "msg": str(exc)}
 
     def get_klines(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-        if self.paper_trading:
-            return pd.DataFrame()
-
         params = {
             "symbol": self.normalize_symbol(symbol),
             "interval": _to_api_interval(interval),
@@ -606,7 +603,20 @@ class BingXTrader:
         last_response: Dict[str, Any] = {"code": -1, "msg": "klines request was not attempted"}
 
         for attempt in range(1, self.klines_max_retries + 1):
-            response = self._request("GET", "/openApi/swap/v3/quote/klines", params)
+            if self.paper_trading:
+                try:
+                    response = self.session.get(
+                        f"{self.BASE_URL}/openApi/swap/v3/quote/klines",
+                        params=params,
+                        timeout=self.request_timeout,
+                    )
+                    payload = response.json() if response.status_code == 200 else {"code": -1, "msg": response.text}
+                except Exception as exc:
+                    payload = {"code": -1, "msg": str(exc)}
+            else:
+                payload = self._request("GET", "/openApi/swap/v3/quote/klines", params)
+
+            response = payload
             if response.get("code") == 0:
                 rows = response.get("data", [])
                 if not rows:
@@ -882,8 +892,6 @@ class BingXTrader:
         return response.get("code") == 0
 
     def get_last_price(self, symbol: str) -> float:
-        if self.paper_trading:
-            return 0.0
         frame = self.get_klines(symbol, "1m", limit=1)
         if frame.empty:
             return 0.0
