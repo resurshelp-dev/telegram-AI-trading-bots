@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading Suite 3bar Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading-bots
+Environment=TRADING_PYTHON=/opt/trading-bots/.venv/bin/python
+ExecStart=/opt/trading-bots/trading_suite/bin/run_3bar.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/trading-bots/trading_suite/runtime/3bar/logs/stdout.log
+StandardError=append:/opt/trading-bots/trading_suite/runtime/3bar/logs/stderr.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading Suite Svechi Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading-bots
+Environment=TRADING_PYTHON=/opt/trading-bots/.venv/bin/python
+ExecStart=/opt/trading-bots/trading_suite/bin/run_svechi.sh
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/trading-bots/trading_suite/runtime/svechi/logs/stdout.log
+StandardError=append:/opt/trading-bots/trading_suite/runtime/svechi/logs/stderr.log
+
+[Install]
+WantedBy=multi-user.target
