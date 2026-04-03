@@ -143,6 +143,31 @@ def summarize_svechi() -> Dict[str, Any]:
     }
 
 
+def summarize_kaktak() -> Dict[str, Any]:
+    root = RUNTIME_DIR / "kaktak"
+    state = read_json(root / "runtime_state.json") or {}
+    return {
+        "bot": "kaktak",
+        "paper_mode": True,
+        "lock_present": False,
+        "last_run_at": state.get("updated_at") or state.get("last_loop_at") or state.get("timestamp"),
+        "last_run_age_sec": age_seconds(state.get("updated_at") or state.get("last_loop_at") or state.get("timestamp")),
+        "last_error": state.get("last_error"),
+        "symbol": state.get("symbol") or "BTCUSDT",
+        "open_trade": state.get("position") or state.get("open_trade"),
+        "paper_summary": {
+            "trade_log_rows": count_json_items(root / "trade_log.json"),
+            "state": state,
+        },
+        "logs": {
+            "app": file_meta(root / "bot.log"),
+            "events": file_meta(root / "events.jsonl"),
+            "stdout": file_meta(root / "stdout.log"),
+            "stderr": file_meta(root / "stderr.log"),
+        },
+    }
+
+
 def summarize_fixed() -> Dict[str, Any]:
     root = RUNTIME_DIR / "fixed"
     state = read_json(root / "state" / "runtime_state.json") or {}
@@ -173,6 +198,7 @@ def build_summary() -> Dict[str, Any]:
         summarize_correction(),
         summarize_three_bar(),
         summarize_svechi(),
+        summarize_kaktak(),
         summarize_fixed(),
     ]
     return {
