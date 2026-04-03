@@ -381,7 +381,6 @@ class BingXTrader:
                 return {"code": 0, "data": {"orderId": f"paper_{int(time.time() * 1000)}"}}
             if "positions" in endpoint:
                 return {"code": 0, "data": []}
-            return {"code": 0, "data": {}}
 
         params = dict(params or {})
         params["timestamp"] = int(time.time() * 1000)
