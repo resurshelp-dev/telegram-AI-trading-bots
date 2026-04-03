@@ -53,6 +53,22 @@ def save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def telegram_status(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": bool(result.get("ok")),
+        "msg": result.get("msg") or result.get("description") or result.get("detail"),
+    }
+
+
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str, bot_tag: str) -> None:
         self.token = token.strip()
@@ -127,12 +143,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def is_meaningful_execution(payload: Dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    message = str(payload.get("msg", "")).strip()
+    if message in {"No new closed bar yet", "Trade not armed for trailing yet", "No fresh signal"}:
+        return False
+    if message == "Signal executed" or message.startswith("Paper trade closed"):
+        return True
+    return not bool(payload.get("ok", True))
+
+
 def main() -> None:
     from three_bar_live import execute_plan, scan_plans
 
     parser = build_parser()
     args = parser.parse_args()
+    scan_payload = scan_plans(args)
+    if args.command == "scan":
+        print(json.dumps(scan_payload, indent=2, ensure_ascii=False))
+        return
+
     daemon_state_path = Path(args.daemon_state_file)
+    daemon_state = load_json(daemon_state_path)
     event_log_path = Path(args.event_log_file)
     notifier = TelegramNotifier(
         token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -142,6 +175,7 @@ def main() -> None:
     paper_mode = parse_bool(args.paper if args.paper is not None else os.getenv("PAPER", "true"))
     last_heartbeat = 0.0
     loop_index = 0
+    last_notified_signal_key = str(daemon_state.get("last_notified_signal_key", "")).strip()
 
     append_event(
         event_log_path,
@@ -174,31 +208,48 @@ def main() -> None:
         loop_index += 1
         try:
             scan_payload = scan_plans(args)
-            execution_payload = None
-            if scan_payload.get("selected_plan") is not None:
-                selected_plan = scan_payload["selected_plan"]
-                print_status(
-                    "signal detected",
-                    {
-                        "loop": loop_index,
-                        "symbol": selected_plan.get("symbol"),
-                        "direction": selected_plan.get("direction"),
-                        "entry": selected_plan.get("entry_price"),
-                        "stop": selected_plan.get("stop_price"),
-                        "age_min": selected_plan.get("signal_age_minutes"),
-                    },
-                )
-                notifier.send(
-                    "signal detected",
-                    {
-                        "symbol": selected_plan.get("symbol"),
-                        "direction": selected_plan.get("direction"),
-                        "entry": selected_plan.get("entry_price"),
-                        "stop": selected_plan.get("stop_price"),
-                        "age_min": selected_plan.get("signal_age_minutes"),
-                    },
-                )
-                execution_payload = execute_plan(args, scan_payload)
+            selected_plan = scan_payload.get("selected_plan")
+            active_trade = scan_payload.get("active_trade")
+            if selected_plan is not None and active_trade is None:
+                current_signal_key = str(selected_plan.get("signal_key", "")).strip()
+                if current_signal_key and current_signal_key != last_notified_signal_key:
+                    print_status(
+                        "signal detected",
+                        {
+                            "loop": loop_index,
+                            "symbol": selected_plan.get("symbol"),
+                            "direction": selected_plan.get("direction"),
+                            "entry": selected_plan.get("entry_price"),
+                            "stop": selected_plan.get("stop_price"),
+                            "age_min": selected_plan.get("signal_age_minutes"),
+                        },
+                    )
+                    signal_result = notifier.send(
+                        "signal detected",
+                        {
+                            "symbol": selected_plan.get("symbol"),
+                            "direction": selected_plan.get("direction"),
+                            "entry": selected_plan.get("entry_price"),
+                            "stop": selected_plan.get("stop_price"),
+                            "age_min": selected_plan.get("signal_age_minutes"),
+                        },
+                    )
+                    signal_status = telegram_status(signal_result)
+                    print_status(
+                        "telegram signal",
+                        {
+                            "loop": loop_index,
+                            "ok": signal_status["ok"],
+                            "msg": signal_status["msg"],
+                            "signal_key": current_signal_key,
+                        },
+                    )
+                    if signal_status["ok"]:
+                        last_notified_signal_key = current_signal_key
+                        daemon_state["last_notified_signal_key"] = current_signal_key
+                        daemon_state["last_notified_signal_at"] = utc_now_iso()
+            execution_payload = execute_plan(args, scan_payload)
+            if is_meaningful_execution(execution_payload):
                 print_status(
                     "execution result",
                     {
@@ -211,7 +262,7 @@ def main() -> None:
                         "paper_trading": execution_payload.get("paper_trading"),
                     },
                 )
-                notifier.send(
+                execution_result = notifier.send(
                     "execution result",
                     {
                         "ok": execution_payload.get("ok"),
@@ -220,6 +271,17 @@ def main() -> None:
                         "direction": execution_payload.get("direction"),
                         "quantity": execution_payload.get("quantity"),
                         "paper_trading": execution_payload.get("paper_trading"),
+                    },
+                )
+                execution_status = telegram_status(execution_result)
+                print_status(
+                    "telegram execution",
+                    {
+                        "loop": loop_index,
+                        "ok": execution_status["ok"],
+                        "msg": execution_status["msg"],
+                        "symbol": execution_payload.get("symbol"),
+                        "direction": execution_payload.get("direction"),
                     },
                 )
             payload = {
@@ -230,22 +292,26 @@ def main() -> None:
                 "execution": execution_payload,
             }
             append_event(event_log_path, payload)
-            save_json(
-                daemon_state_path,
+            daemon_state.update(
                 {
                     "last_loop": loop_index,
                     "last_run_at": utc_now_iso(),
                     "last_scan": scan_payload,
                     "last_execution": execution_payload,
                     "poll_seconds": args.poll_seconds,
-                },
+                    "last_notified_signal_key": last_notified_signal_key,
+                }
             )
+            save_json(daemon_state_path, daemon_state)
         except Exception as exc:
             error_payload = {"time": utc_now_iso(), "type": "error", "loop": loop_index, "error": str(exc)}
             append_event(event_log_path, error_payload)
-            save_json(daemon_state_path, {"last_loop": loop_index, "last_error": error_payload, "last_run_at": utc_now_iso()})
+            daemon_state.update({"last_loop": loop_index, "last_error": error_payload, "last_run_at": utc_now_iso()})
+            save_json(daemon_state_path, daemon_state)
             print_status("error", {"loop": loop_index, "symbol": args.symbol, "error": str(exc)})
-            notifier.send("error", {"loop": loop_index, "error": str(exc), "symbol": args.symbol})
+            error_result = notifier.send("error", {"loop": loop_index, "error": str(exc), "symbol": args.symbol})
+            error_status = telegram_status(error_result)
+            print_status("telegram error", {"loop": loop_index, "ok": error_status["ok"], "msg": error_status["msg"]})
 
         now_ts = time.time()
         if now_ts - last_heartbeat >= args.heartbeat_minutes * 60:
@@ -263,7 +329,15 @@ def main() -> None:
                 "heartbeat",
                 {"loop": loop_index, "symbol": args.symbol, "paper": paper_mode, "status": "running"},
             )
-            notifier.send("heartbeat", {"loop": loop_index, "symbol": args.symbol, "paper": paper_mode, "status": "running"})
+            heartbeat_result = notifier.send(
+                "heartbeat",
+                {"loop": loop_index, "symbol": args.symbol, "paper": paper_mode, "status": "running"},
+            )
+            heartbeat_status = telegram_status(heartbeat_result)
+            print_status(
+                "telegram heartbeat",
+                {"loop": loop_index, "ok": heartbeat_status["ok"], "msg": heartbeat_status["msg"]},
+            )
             last_heartbeat = now_ts
 
         if args.max_loops and loop_index >= args.max_loops:

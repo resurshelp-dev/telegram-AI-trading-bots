@@ -173,6 +173,15 @@ def save_state(payload: Dict[str, object]) -> None:
     STATE_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def load_state() -> Dict[str, object]:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def current_datasets() -> Dict[str, Path]:
     jan_src = ROOT / "correction" / "data_cache_dec_jan_trend" / "ETH_USDT_5m_61d_20260131T235959Z.csv"
     jan_slice = SVECHI_DIR / "month_datasets" / "ETH_USDT_5m_2026-01_slice.csv"
@@ -284,6 +293,28 @@ def build_telegram_text(results: Dict[str, object], latest_signal: Dict[str, obj
     return "\n".join(lines)
 
 
+def latest_signal_fingerprint(latest_signal: Dict[str, object]) -> str:
+    signals = latest_signal.get("signals", [])
+    if not signals:
+        return ""
+    parts: List[str] = []
+    for item in signals:
+        parts.append(
+            "|".join(
+                [
+                    str(item.get("timeframe", "")),
+                    str(item.get("pattern", "")),
+                    str(item.get("direction", "")),
+                    str(item.get("signal_time", "")),
+                    f"{float(item.get('reference_price', 0.0)):.8f}",
+                    f"{float(item.get('stop_price', 0.0)):.8f}",
+                    str(item.get("hold_minutes", "")),
+                ]
+            )
+        )
+    return "signals:" + ";".join(sorted(parts))
+
+
 def run_once(config: Dict[str, object]) -> Dict[str, object]:
     datasets = current_datasets()
     results: Dict[str, object] = {}
@@ -300,6 +331,7 @@ def run_once(config: Dict[str, object]) -> Dict[str, object]:
         "results": results,
         "latest_signal": latest_signal,
         "telegram": {"ok": False, "detail": "Heartbeat handles Telegram delivery."},
+        "telegram_message": telegram_text,
     }
     (REPORTS_DIR / "final_summary.json").write_text(json.dumps(consolidated, indent=2), encoding="utf-8")
     (REPORTS_DIR / "telegram_message.txt").write_text(telegram_text, encoding="utf-8")
@@ -313,6 +345,7 @@ def main() -> None:
         heartbeat_minutes = int(os.getenv("HEARTBEAT_MINUTES", "60") or 60)
         last_heartbeat = 0.0
         loop_index = 0
+        state = load_state()
 
         print_status(
             "system started",
@@ -340,8 +373,26 @@ def main() -> None:
             try:
                 consolidated = run_once(config)
                 signal_count = int(consolidated["latest_signal"]["signal_count"])
+                signal_fingerprint = latest_signal_fingerprint(consolidated["latest_signal"])
+                telegram_result = {"ok": False, "detail": "No active signals."}
+                telegram_sent = False
+                if signal_count > 0 and signal_fingerprint and signal_fingerprint != str(state.get("last_signal_notification_key", "")):
+                    telegram_result = send_telegram_message(str(consolidated["telegram_message"]))
+                    telegram_sent = bool(telegram_result.get("ok"))
+                    if telegram_sent:
+                        state["last_signal_notification_key"] = signal_fingerprint
+                        state["last_signal_notification_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+                    print_status(
+                        "telegram signal",
+                        {
+                            "loop": loop_index,
+                            "sent": telegram_sent,
+                            "signal_count": signal_count,
+                            "detail": telegram_result.get("detail"),
+                        },
+                    )
                 print_status("scan complete", {"loop": loop_index, "signal_count": signal_count, "status": "ok"})
-                save_state(
+                state.update(
                     {
                         "last_loop": loop_index,
                         "last_run_at": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -349,18 +400,23 @@ def main() -> None:
                         "paper": config["paper"],
                         "capital": config["initial_capital"],
                         "risk_percent": config["risk_percent"],
+                        "last_telegram_send": telegram_result,
                     }
                 )
+                save_state(state)
             except Exception as exc:
                 print_status("error", {"loop": loop_index, "error": str(exc)})
                 send_telegram_message(f"[{config['bot_tag']}] error\nloop: {loop_index}\nerror: {exc}")
-                save_state(
+                state.update(
                     {
                         "last_loop": loop_index,
                         "last_run_at": pd.Timestamp.now(tz="UTC").isoformat(),
                         "last_error": str(exc),
                         "paper": config["paper"],
                     }
+                )
+                save_state(
+                    state
                 )
 
             now_ts = time.time()
