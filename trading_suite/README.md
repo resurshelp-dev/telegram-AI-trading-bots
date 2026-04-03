@@ -7,7 +7,6 @@ Included bots:
 - `correction`
 - `3bar`
 - `svechi`
-- `kaktak`
 - `fixed`
 
 Recommended server layout:
@@ -50,7 +49,6 @@ All runtime data goes here:
 - `trading_suite/runtime/correction`
 - `trading_suite/runtime/3bar`
 - `trading_suite/runtime/svechi`
-- `trading_suite/runtime/kaktak`
 - `trading_suite/runtime/fixed`
 - `trading_suite/runtime/summary`
 
@@ -69,7 +67,6 @@ trading_suite/bin/prepare_runtime.sh
 trading_suite/bin/run_correction.sh
 trading_suite/bin/run_3bar.sh
 trading_suite/bin/run_svechi.sh
-trading_suite/bin/run_kaktak.sh
 trading_suite/bin/run_fixed.sh
 trading_suite/bin/run_summary_loop.sh
 ```
@@ -90,7 +87,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now trading-correction.service
 sudo systemctl enable --now trading-3bar.service
 sudo systemctl enable --now trading-svechi.service
-sudo systemctl enable --now trading-kaktak.service
 sudo systemctl enable --now trading-fixed.service
 sudo systemctl enable --now trading-summary.service
 ```
@@ -106,5 +102,4 @@ If you want the safest first rollout, start in this order:
 2. `trading-correction.service`
 3. `trading-3bar.service`
 4. `trading-svechi.service`
-5. `trading-kaktak.service`
-6. `trading-fixed.service`
+5. `trading-fixed.service`
