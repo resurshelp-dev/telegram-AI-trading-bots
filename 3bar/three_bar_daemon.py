@@ -159,11 +159,6 @@ def main() -> None:
 
     parser = build_parser()
     args = parser.parse_args()
-    scan_payload = scan_plans(args)
-    if args.command == "scan":
-        print(json.dumps(scan_payload, indent=2, ensure_ascii=False))
-        return
-
     daemon_state_path = Path(args.daemon_state_file)
     daemon_state = load_json(daemon_state_path)
     event_log_path = Path(args.event_log_file)
