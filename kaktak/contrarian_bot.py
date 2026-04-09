@@ -108,6 +108,10 @@ class Config:
     SMOKE_TEST_QTY: float = 0.0001
     SMOKE_TEST_SIDE: str = "BUY"
     ENABLE_STATE_RECOVERY: bool = True
+    PAPER_ENTRY_SLIPPAGE_BPS: float = 5.0
+    PAPER_EXIT_SLIPPAGE_BPS: float = 7.5
+    PAPER_TAKER_FEE_RATE: float = 0.0005
+    PAPER_FUNDING_RATE_PER_8H: float = 0.0001
 
     API_KEY: str = ""
     SECRET_KEY: str = ""
@@ -1052,6 +1056,43 @@ class ContrarianBot:
                 + "\n"
             )
 
+    def _paper_fill_price(self, reference_price: float, direction: str, *, is_entry: bool) -> float:
+        if reference_price <= 0:
+            return 0.0
+        bps = self.config.PAPER_ENTRY_SLIPPAGE_BPS if is_entry else self.config.PAPER_EXIT_SLIPPAGE_BPS
+        slip = max(0.0, float(bps)) / 10_000.0
+        if direction == "long":
+            multiplier = 1.0 + slip if is_entry else 1.0 - slip
+        else:
+            multiplier = 1.0 - slip if is_entry else 1.0 + slip
+        return self._round_price(reference_price * multiplier)
+
+    def _paper_costs(
+        self,
+        entry_price: float,
+        exit_price: float,
+        size: float,
+        entry_time: pd.Timestamp,
+        exit_time: pd.Timestamp,
+    ) -> Dict[str, float]:
+        fee_rate = max(0.0, float(self.config.PAPER_TAKER_FEE_RATE))
+        funding_rate = max(0.0, float(self.config.PAPER_FUNDING_RATE_PER_8H))
+        entry_notional = abs(entry_price * size)
+        exit_notional = abs(exit_price * size)
+        fees = (entry_notional + exit_notional) * fee_rate
+
+        holding_hours = 0.0
+        if entry_time is not None and exit_time is not None:
+            holding_hours = max(0.0, (exit_time - entry_time).total_seconds() / 3600.0)
+        funding_periods = holding_hours / 8.0
+        avg_notional = (entry_notional + exit_notional) / 2.0
+        funding_cost = avg_notional * funding_rate * funding_periods if funding_periods > 0 else 0.0
+        return {
+            "fees": float(fees),
+            "funding_cost": float(funding_cost),
+            "holding_hours": float(holding_hours),
+        }
+
     def _maybe_warn_stall(self, latest_signal_candle: pd.Timestamp, now_dt: datetime) -> None:
         if self.last_market_data_at is None:
             self.last_market_data_at = now_dt
@@ -1314,7 +1355,13 @@ class ContrarianBot:
             return 0.0
         return round(size, self.config.QTY_PRECISION)
 
-    def execute_signal(self, signal: Dict[str, Any], live_order: bool = False) -> bool:
+    def execute_signal(
+        self,
+        signal: Dict[str, Any],
+        live_order: bool = False,
+        market_price: Optional[float] = None,
+        execution_time: Optional[pd.Timestamp] = None,
+    ) -> bool:
         size = self._calculate_size(signal["entry"], signal["stop"])
         if size <= 0:
             self.logger.warning(
@@ -1327,7 +1374,9 @@ class ContrarianBot:
         stop = float(signal["stop"])
         tp = float(signal["tp"])
         initial_risk = abs(entry - stop)
+        rr_value = float(signal.get("rr", self.config.RISK_REWARD_RATIO))
         side = "BUY" if signal["direction"] == "long" else "SELL"
+        entry_time = pd.Timestamp(execution_time or signal["time"])
 
         order_id = None
         if live_order:
@@ -1336,21 +1385,33 @@ class ContrarianBot:
                 self.logger.error("Exchange rejected entry order.")
                 return False
 
-            time.sleep(2)
-            exchange_position = self.trader.get_open_position(self.config.SYMBOL, signal["direction"])
-            if exchange_position:
-                real_entry = self.trader.extract_entry_price(exchange_position)
-                exchange_size = abs(float(exchange_position.get("positionAmt", 0) or 0))
-                if real_entry > 0:
-                    entry = real_entry
+            if self.config.PAPER_TRADING:
+                reference_price = float(market_price or 0.0) or self.trader.get_last_price(self.config.SYMBOL) or entry
+                paper_entry = self._paper_fill_price(reference_price, signal["direction"], is_entry=True)
+                if paper_entry > 0:
+                    entry = paper_entry
                     if signal["direction"] == "long":
-                        stop = real_entry - initial_risk
-                        tp = real_entry + initial_risk * self.config.RISK_REWARD_RATIO
+                        stop = paper_entry - initial_risk
+                        tp = paper_entry + initial_risk * rr_value
                     else:
-                        stop = real_entry + initial_risk
-                        tp = real_entry - initial_risk * self.config.RISK_REWARD_RATIO
-                if exchange_size > 0:
-                    size = round(exchange_size, self.config.QTY_PRECISION)
+                        stop = paper_entry + initial_risk
+                        tp = paper_entry - initial_risk * rr_value
+            else:
+                time.sleep(2)
+                exchange_position = self.trader.get_open_position(self.config.SYMBOL, signal["direction"])
+                if exchange_position:
+                    real_entry = self.trader.extract_entry_price(exchange_position)
+                    exchange_size = abs(float(exchange_position.get("positionAmt", 0) or 0))
+                    if real_entry > 0:
+                        entry = real_entry
+                        if signal["direction"] == "long":
+                            stop = real_entry - initial_risk
+                            tp = real_entry + initial_risk * rr_value
+                        else:
+                            stop = real_entry + initial_risk
+                            tp = real_entry - initial_risk * rr_value
+                    if exchange_size > 0:
+                        size = round(exchange_size, self.config.QTY_PRECISION)
 
         self.position = {
             "type": signal["direction"],
@@ -1358,21 +1419,22 @@ class ContrarianBot:
             "size": float(size),
             "stop": float(stop),
             "tp": float(tp),
-            "entry_time": signal["time"],
+            "entry_time": entry_time,
             "signal_type": signal["type"],
             "order_id": order_id or f"backtest_{int(time.time() * 1000)}",
             "initial_risk": initial_risk,
-            "rr": float(signal.get("rr", self.config.RISK_REWARD_RATIO)),
+            "rr": rr_value,
             "breakeven_trigger_r": float(signal.get("breakeven_trigger_r", self.config.BREAKEVEN_TRIGGER_R)),
             "trail_trigger_r": float(signal.get("trail_trigger_r", self.config.TRAIL_TRIGGER_R)),
             "trail_distance_r": float(signal.get("trail_distance_r", self.config.TRAIL_DISTANCE_R)),
             "trend": signal.get("trend"),
             "vol_ratio": signal.get("vol_ratio"),
             "trend_strength_r": signal.get("trend_strength_r"),
+            "execution_mode": "paper_live_market" if self.config.PAPER_TRADING and live_order else ("live_market" if live_order else "backtest"),
         }
-        self.last_trade_time = pd.Timestamp(signal["time"])
+        self.last_trade_time = entry_time
 
-        if live_order:
+        if live_order and not self.config.PAPER_TRADING:
             protection_ok = self.trader.set_protection_orders(
                 symbol=self.config.SYMBOL,
                 direction=signal["direction"],
@@ -1408,6 +1470,7 @@ class ContrarianBot:
                 "signal_type": self.position["signal_type"],
                 "rr": self.position["rr"],
                 "order_id": self.position["order_id"],
+                "execution_mode": self.position["execution_mode"],
             },
         )
         self._notify(
@@ -1416,7 +1479,8 @@ class ContrarianBot:
             f"entry: {self.position['entry']:.2f}\n"
             f"stop: {self.position['stop']:.2f}\n"
             f"tp: {self.position['tp']:.2f}\n"
-            f"size: {self.position['size']:.6f}"
+            f"size: {self.position['size']:.6f}\n"
+            f"mode: {self.position['execution_mode']}"
         )
         self._save_state()
 
@@ -1551,26 +1615,46 @@ class ContrarianBot:
         if not self.position:
             raise RuntimeError("No open position to close.")
 
+        filled_exit_price = float(exit_price)
+        if self.config.PAPER_TRADING:
+            adverse_exit = self._paper_fill_price(filled_exit_price, self.position["type"], is_entry=False)
+            if adverse_exit > 0:
+                filled_exit_price = adverse_exit
+
         if self.position["type"] == "long":
-            pnl = (exit_price - self.position["entry"]) * self.position["size"]
+            gross_pnl = (filled_exit_price - self.position["entry"]) * self.position["size"]
         else:
-            pnl = (self.position["entry"] - exit_price) * self.position["size"]
+            gross_pnl = (self.position["entry"] - filled_exit_price) * self.position["size"]
+
+        costs = self._paper_costs(
+            entry_price=float(self.position["entry"]),
+            exit_price=filled_exit_price,
+            size=float(self.position["size"]),
+            entry_time=pd.Timestamp(self.position["entry_time"]),
+            exit_time=exit_time,
+        ) if self.config.PAPER_TRADING else {"fees": 0.0, "funding_cost": 0.0, "holding_hours": 0.0}
+        pnl = gross_pnl - costs["fees"] - costs["funding_cost"]
 
         trade = {
             "entry_time": str(self.position["entry_time"]),
             "entry_price": self.position["entry"],
             "exit_time": str(exit_time),
-            "exit_price": float(exit_price),
+            "exit_price": float(filled_exit_price),
             "type": self.position["type"],
             "signal_type": self.position["signal_type"],
             "size": self.position["size"],
             "pnl": float(pnl),
+            "gross_pnl": float(gross_pnl),
+            "fees": float(costs["fees"]),
+            "funding_cost": float(costs["funding_cost"]),
+            "holding_hours": float(costs["holding_hours"]),
             "pnl_percent": float((pnl / (self.position["entry"] * self.position["size"])) * 100),
             "exit_reason": reason,
             "rr": self.position.get("rr"),
             "trend": self.position.get("trend"),
             "vol_ratio": self.position.get("vol_ratio"),
             "trend_strength_r": self.position.get("trend_strength_r"),
+            "execution_mode": self.position.get("execution_mode"),
         }
 
         self.trades.append(trade)
@@ -1582,7 +1666,7 @@ class ContrarianBot:
                 "Closed %s | exit=%s | price=%.2f | pnl=%+.2f | capital=%.2f",
                 trade["signal_type"],
                 reason,
-                exit_price,
+                filled_exit_price,
                 pnl,
                 self.capital,
             )
@@ -1595,6 +1679,9 @@ class ContrarianBot:
                 "entry_price": trade["entry_price"],
                 "exit_price": trade["exit_price"],
                 "pnl": trade["pnl"],
+                "gross_pnl": trade["gross_pnl"],
+                "fees": trade["fees"],
+                "funding_cost": trade["funding_cost"],
                 "pnl_percent": trade["pnl_percent"],
                 "signal_type": trade["signal_type"],
             },
@@ -1605,6 +1692,8 @@ class ContrarianBot:
             f"signal: {trade['signal_type']}\n"
             f"reason: {reason}\n"
             f"exit: {trade['exit_price']:.2f}\n"
+            f"gross: {trade['gross_pnl']:+.2f} USDT\n"
+            f"costs: {(trade['fees'] + trade['funding_cost']):.2f} USDT\n"
             f"pnl: {sign}{abs(trade['pnl']):.2f} USDT\n"
             f"capital: {self.capital:.2f}"
         )
@@ -1834,7 +1923,7 @@ class ContrarianBot:
                     signal = self.check_contrarian_signals(signal_df, len(signal_df) - 1)
                     if signal:
                         tuned_signal = self._apply_market_exit_tuning(signal, signal_df)
-                        self.execute_signal(tuned_signal, live_order=True)
+                        self.execute_signal(tuned_signal, live_order=True, market_price=current_price, execution_time=current_time)
                         self.save_trade_log()
 
                 self._save_state()
@@ -1881,6 +1970,9 @@ class ContrarianBot:
             "losing_trades": int(len(losing)),
             "win_rate": float((len(winning) / len(trades_df)) * 100),
             "total_pnl": float(trades_df["pnl"].sum()),
+            "gross_total_pnl": float(trades_df["gross_pnl"].sum()) if "gross_pnl" in trades_df else float(trades_df["pnl"].sum()),
+            "total_fees": float(trades_df["fees"].sum()) if "fees" in trades_df else 0.0,
+            "total_funding_cost": float(trades_df["funding_cost"].sum()) if "funding_cost" in trades_df else 0.0,
             "final_capital": float(self.capital),
             "return_percent": float(((self.capital / self.config.INITIAL_CAPITAL) - 1) * 100),
             "avg_win": float(winning["pnl"].mean()) if not winning.empty else 0.0,
